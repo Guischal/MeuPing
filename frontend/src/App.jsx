@@ -134,7 +134,7 @@ export default function App() {
     }
 
     fetchRealtimePing()
-    const pingInterval = window.setInterval(fetchRealtimePing, 2000)
+    const pingInterval = window.setInterval(fetchRealtimePing, 1500)
 
     return () => {
       cancelled = true
