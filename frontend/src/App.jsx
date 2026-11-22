@@ -246,7 +246,7 @@ export default function App() {
 
         <nav className="main-nav" aria-label="Navegação principal">
           <button className={page === 'Dashboard' ? 'nav-item active' : 'nav-item'} onClick={() => setPage('Dashboard')}>
-            <Home size={18} /> Dashboard
+            <Home size={18} /> Início
           </button>
           <button className={page === 'Histórico' ? 'nav-item active' : 'nav-item'} onClick={() => setPage('Histórico')}>
             <BarChart3 size={18} /> Histórico
