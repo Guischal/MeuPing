@@ -1,5 +1,14 @@
 # Meu Ping
 
+*PARA INICIAR O BACK*
+cd backend
+.\.venv\Scripts\Activate.ps1
+uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+
+*PARA INICIAR O FRONT*
+cd frontend
+npm run dev
+
 **Sua conexão, em detalhes.**
 
 Sistema local de monitoramento de desempenho de rede.
