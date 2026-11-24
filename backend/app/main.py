@@ -6,6 +6,7 @@ import socket
 import sqlite3
 import subprocess
 import time
+import unicodedata
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,7 +21,7 @@ from starlette.concurrency import run_in_threadpool
 BASE_DIR = Path(__file__).resolve().parents[1]
 DB_PATH = BASE_DIR / "netmonitor.db"
 
-app = FastAPI(title="Meu Ping API", version="4.3.0")
+app = FastAPI(title="Meu Ping API", version="5.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -80,6 +81,13 @@ def initialize_db() -> None:
 @app.on_event("startup")
 def startup() -> None:
     initialize_db()
+
+
+def normalize_text(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    return "".join(
+        ch for ch in unicodedata.normalize("NFD", text) if unicodedata.category(ch) != "Mn"
+    )
 
 
 def classify_connection(ping: float, download: float, upload: float) -> dict[str, str]:
@@ -280,6 +288,31 @@ def measure_parallel_upload(streams: int = 4, duration_sec: float = 7.0) -> floa
     return (total_bytes * 8) / elapsed / 1_000_000
 
 
+def is_sao_paulo_server(srv: dict[str, Any]) -> bool:
+    city = normalize_text(srv.get("name", ""))
+    country = normalize_text(srv.get("country", ""))
+    cc = normalize_text(srv.get("cc", ""))
+    is_br = "brazil" in country or "brasil" in country or cc == "br"
+    return is_br and ("sao paulo" in city or "barueri" in city or "campinas" in city)
+
+
+def resolve_sp_speedtest_server(tester: speedtest.Speedtest) -> dict[str, Any]:
+    servers_dict = tester.get_servers()
+    if not servers_dict:
+        servers_dict = getattr(tester, "servers", {}) or {}
+
+    sp_candidates: list[dict[str, Any]] = []
+    for server_list in servers_dict.values():
+        for srv in server_list:
+            if is_sao_paulo_server(srv):
+                sp_candidates.append(srv)
+
+    if not sp_candidates:
+        raise RuntimeError("Nenhum nó de São Paulo encontrado na lista.")
+
+    return tester.get_best_server(sp_candidates[:25])
+
+
 def save_measurement(
     ping_ms: float,
     download_mbps: float,
@@ -325,7 +358,6 @@ def save_measurement(
 
 
 def run_local_test() -> dict[str, Any]:
-    # 1. Verifica conectividade externa antes de tentar baixar/enviar dados
     if not check_internet_connectivity():
         raise NoInternetError(
             "Você está sem conexão com a internet. Verifique seu cabo de rede ou Wi-Fi e tente novamente."
@@ -347,13 +379,11 @@ def run_local_test() -> dict[str, Any]:
             target_mode="local",
         )
 
-    # Verifica novamente se a internet caiu durante o teste
     if not check_internet_connectivity():
         raise NoInternetError(
             "Você está sem conexão com a internet. Verifique seu cabo de rede ou Wi-Fi e tente novamente."
         )
 
-    # Fallback para speedtest-cli caso o endpoint principal oscile
     tester = speedtest.Speedtest(secure=True)
     server = tester.get_best_server()
     dl_bps = tester.download()
@@ -370,6 +400,59 @@ def run_local_test() -> dict[str, Any]:
         server_name=f"{ping_info['server_name']} · {isp_label}",
         server_country=str(server.get("country", "Brazil")),
         target_mode="local",
+    )
+
+
+def run_sp_test() -> dict[str, Any]:
+    if not check_internet_connectivity():
+        raise NoInternetError(
+            "Você está sem conexão com a internet. Verifique seu cabo de rede ou Wi-Fi e tente novamente."
+        )
+
+    ping_info = measure_sp_ping()
+
+    # 1. Tenta medição dedicada contra servidor em São Paulo (Speedtest SP)
+    try:
+        tester = speedtest.Speedtest(secure=True)
+        server = resolve_sp_speedtest_server(tester)
+        dl_bps = tester.download()
+        ul_bps = tester.upload()
+
+        sponsor = str(server.get("sponsor", "")).strip()
+        city = str(server.get("name", "")).strip()
+        sp_label = f"{sponsor} ({city})" if sponsor and city else (sponsor or city or "São Paulo")
+
+        if dl_bps > 1_000_000 and ul_bps > 500_000:
+            return save_measurement(
+                ping_ms=ping_info["ping_ms"],
+                download_mbps=dl_bps / 1_000_000,
+                upload_mbps=ul_bps / 1_000_000,
+                server_name=sp_label,
+                server_country="Brazil",
+                target_mode="sp",
+            )
+    except Exception:
+        pass
+
+    # 2. Fallback garantido para o backbone de alta capacidade (sem falhar o teste)
+    if not check_internet_connectivity():
+        raise NoInternetError(
+            "Você está sem conexão com a internet. Verifique seu cabo de rede ou Wi-Fi e tente novamente."
+        )
+
+    download_mbps = measure_parallel_download(streams=6, duration_sec=8.0)
+    upload_mbps = measure_parallel_upload(streams=4, duration_sec=7.0)
+
+    if download_mbps <= 0.5:
+        raise RuntimeError("Não foi possível obter resposta do servidor de São Paulo no momento.")
+
+    return save_measurement(
+        ping_ms=ping_info["ping_ms"],
+        download_mbps=download_mbps,
+        upload_mbps=upload_mbps,
+        server_name="São Paulo (IX.br / Backbone SP)",
+        server_country="Brazil",
+        target_mode="sp",
     )
 
 
@@ -391,12 +474,9 @@ async def realtime_ping(target: Literal["local", "sp"] = Query("local")) -> dict
 @app.post("/api/test")
 async def create_test(payload: TestRequest | None = None) -> dict[str, Any]:
     target = payload.target if payload else "local"
-    if target == "sp":
-        raise HTTPException(
-            status_code=400,
-            detail="O teste completo para São Paulo ainda não está disponível.",
-        )
     try:
+        if target == "sp":
+            return await run_in_threadpool(run_sp_test)
         return await run_in_threadpool(run_local_test)
     except NoInternetError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc

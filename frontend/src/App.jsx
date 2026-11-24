@@ -1,9 +1,9 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import axios from 'axios'
 import {
   ArrowDown, ArrowDownUp, ArrowUp, BarChart3, Check,
-  ChevronDown, CircleUserRound, Gamepad2, Gauge, Globe, Home, Info, LoaderCircle,
-  Lock, MapPin, Network, Play, Settings, Trash2, WifiOff, X
+  ChevronDown, CircleUserRound, Gamepad2, Gauge, Globe, Home, LoaderCircle,
+  MapPin, Moon, Network, Play, Settings, Sun, Trash2, WifiOff, X
 } from 'lucide-react'
 import {
   Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip,
@@ -11,6 +11,7 @@ import {
 } from 'recharts'
 
 const API = 'http://127.0.0.1:8000'
+const MAX_SCALE_MBPS = 500
 
 function formatTime(value) {
   if (!value) return '—'
@@ -33,7 +34,7 @@ function getPingColor(ping) {
   return `rgb(${r}, ${g}, ${b})`
 }
 
-function MetricCard({ label, value, unit, kind, subtitle }) {
+function MetricCard({ label, value, unit, kind, subtitle, fillPercent = 0, isMeasuring = false, darkMode = false }) {
   const icons = {
     ping: (
       <div
@@ -47,16 +48,69 @@ function MetricCard({ label, value, unit, kind, subtitle }) {
     upload: <ArrowUp size={27} strokeWidth={2.8} />
   }
 
+  const hasLiquid = kind === 'download' || kind === 'upload'
+  const clampedFill = Math.max(0, Math.min(100, fillPercent))
+
+  // Paleta fiel ao projeto (#16865b para Download e #0f766e para Upload)
+  const liquidTopColor = kind === 'download'
+    ? (darkMode ? 'rgba(22, 134, 91, 0.34)' : 'rgba(22, 134, 91, 0.22)')
+    : (darkMode ? 'rgba(15, 118, 110, 0.34)' : 'rgba(15, 118, 110, 0.22)')
+  const liquidBottomColor = kind === 'download'
+    ? (darkMode ? 'rgba(22, 134, 91, 0.14)' : 'rgba(22, 134, 91, 0.08)')
+    : (darkMode ? 'rgba(15, 118, 110, 0.14)' : 'rgba(15, 118, 110, 0.08)')
+  const waveBorderColor = kind === 'download' ? 'rgba(34, 197, 134, 0.55)' : 'rgba(20, 184, 166, 0.55)'
+
   return (
-    <article className={`metric-card ${kind}`}>
-      <div className="metric-icon">{icons[kind]}</div>
-      <div className="metric-copy">
+    <article
+      className={`metric-card ${kind}`}
+      style={{
+        position: 'relative',
+        overflow: 'hidden',
+        borderColor: isMeasuring
+          ? (kind === 'download' ? '#16865b' : '#0f766e')
+          : undefined,
+        transition: 'border-color 0.25s ease, background-color 0.25s ease'
+      }}
+    >
+      {hasLiquid && (
+        <div
+          aria-hidden="true"
+          style={{
+            position: 'absolute',
+            left: 0,
+            right: 0,
+            bottom: 0,
+            height: `${clampedFill}%`,
+            background: `linear-gradient(180deg, ${liquidTopColor} 0%, ${liquidBottomColor} 100%)`,
+            borderTop: clampedFill > 0 ? `2px solid ${waveBorderColor}` : 'none',
+            transition: isMeasuring ? 'height 0.16s linear' : 'height 0.65s cubic-bezier(0.22, 1, 0.36, 1)',
+            pointerEvents: 'none',
+            zIndex: 0
+          }}
+        >
+          {clampedFill > 2 && (
+            <div
+              className="liquid-wave-surface"
+              style={{
+                background: kind === 'download'
+                  ? 'radial-gradient(ellipse at 50% 100%, rgba(22, 134, 91, 0.32) 0%, transparent 70%)'
+                  : 'radial-gradient(ellipse at 50% 100%, rgba(15, 118, 110, 0.32) 0%, transparent 70%)'
+              }}
+            />
+          )}
+        </div>
+      )}
+
+      <div className="metric-icon" style={{ position: 'relative', zIndex: 1 }}>
+        {icons[kind]}
+      </div>
+      <div className="metric-copy" style={{ position: 'relative', zIndex: 1 }}>
         <span className="metric-label">{label}</span>
         <div className="metric-value">
           <strong>{value ?? '—'}</strong>
           <span>{unit}</span>
         </div>
-        {subtitle && <small style={{ fontSize: '0.75rem', opacity: 0.75 }}>{subtitle}</small>}
+        {subtitle && <small style={{ fontSize: '0.75rem', opacity: 0.78 }}>{subtitle}</small>}
       </div>
     </article>
   )
@@ -87,8 +141,49 @@ export default function App() {
 
   const [target, setTarget] = useState('local')
   const [livePing, setLivePing] = useState(null)
-  const [showSpPopup, setShowSpPopup] = useState(false)
   const [showOfflinePopup, setShowOfflinePopup] = useState(false)
+
+  // Tema escuro persistido no navegador
+  const [darkMode, setDarkMode] = useState(() => {
+    try {
+      return window.localStorage.getItem('meuping_theme') === 'dark'
+    } catch {
+      return false
+    }
+  })
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem('meuping_theme', darkMode ? 'dark' : 'light')
+    } catch {
+      // Ignora erro de storage se bloqueado
+    }
+    document.body.classList.toggle('dark-theme', darkMode)
+  }, [darkMode])
+
+  // Estados da animação de líquido (0 a 500 Mbps)
+  const [testPhase, setTestPhase] = useState('idle') // 'idle' | 'download' | 'upload'
+  const [simDownload, setSimDownload] = useState(null)
+  const [simUpload, setSimUpload] = useState(null)
+  const animTimerRef = useRef(null)
+
+  const stopLiquidSimulation = useCallback(() => {
+    if (animTimerRef.current) {
+      window.clearInterval(animTimerRef.current)
+      animTimerRef.current = null
+    }
+    setTestPhase('idle')
+    setSimDownload(null)
+    setSimUpload(null)
+  }, [])
+
+  useEffect(() => {
+    return () => {
+      if (animTimerRef.current) {
+        window.clearInterval(animTimerRef.current)
+      }
+    }
+  }, [])
 
   const loadData = useCallback(async () => {
     try {
@@ -149,15 +244,37 @@ export default function App() {
     setError('')
   }
 
-  const runTest = async () => {
-    if (target === 'sp') {
-      setShowSpPopup(true)
-      return
-    }
+  const startLiquidSimulation = () => {
+    const startTime = performance.now()
+    setTestPhase('download')
+    setSimDownload(0)
+    setSimUpload(0)
 
+    animTimerRef.current = window.setInterval(() => {
+      const elapsedSec = (performance.now() - startTime) / 1000
+
+      if (elapsedSec <= 8.0) {
+        setTestPhase('download')
+        const progress = Math.min(1, elapsedSec / 8.0)
+        const eased = 1 - Math.pow(1 - progress, 2.2)
+        const wave = Math.sin(elapsedSec * 5) * 14 * progress
+        const currentDl = Math.max(0, Math.min(MAX_SCALE_MBPS, eased * 435 + wave))
+        setSimDownload(Number(currentDl.toFixed(2)))
+      } else {
+        setTestPhase('upload')
+        const ulElapsed = elapsedSec - 8.0
+        const progress = Math.min(1, ulElapsed / 7.0)
+        const eased = 1 - Math.pow(1 - progress, 2.0)
+        const wave = Math.sin(ulElapsed * 5.5) * 8 * progress
+        const currentUl = Math.max(0, Math.min(MAX_SCALE_MBPS, eased * 195 + wave))
+        setSimUpload(Number(currentUl.toFixed(2)))
+      }
+    }, 100)
+  }
+
+  const runTest = async () => {
     if (loading || !online) return
 
-    // Verificação imediata no navegador antes mesmo de acionar o backend
     if (typeof navigator !== 'undefined' && navigator.onLine === false) {
       setError('Você está sem conexão com a internet.')
       setShowOfflinePopup(true)
@@ -166,16 +283,20 @@ export default function App() {
 
     setLoading(true)
     setError('')
+    startLiquidSimulation()
+
     try {
-      const response = await axios.post(`${API}/api/test`, { target: 'local' }, { timeout: 180000 })
+      const response = await axios.post(`${API}/api/test`, { target }, { timeout: 180000 })
+      stopLiquidSimulation()
       setLatest(response.data)
       setLivePing({
-        target: 'local',
+        target,
         ping_ms: response.data.ping_ms,
         server_name: response.data.server_name
       })
       await loadData()
     } catch (err) {
+      stopLiquidSimulation()
       const status = err.response?.status
       const message =
         err.response?.data?.detail ||
@@ -234,10 +355,174 @@ export default function App() {
       ? 'Buscando servidor em São Paulo...'
       : 'Buscando roteador local...'
 
-  const isSpUnavailable = target === 'sp'
+  const activeDownloadValue = loading && simDownload !== null
+    ? simDownload
+    : (latest?.download_mbps ?? '—')
+
+  const activeUploadValue = loading && simUpload !== null
+    ? simUpload
+    : (latest?.upload_mbps ?? '—')
+
+  const downloadFillPercent = typeof activeDownloadValue === 'number'
+    ? (activeDownloadValue / MAX_SCALE_MBPS) * 100
+    : 0
+
+  const uploadFillPercent = typeof activeUploadValue === 'number'
+    ? (activeUploadValue / MAX_SCALE_MBPS) * 100
+    : 0
+
+  const buttonLabel = !loading
+    ? 'Iniciar teste'
+    : testPhase === 'upload'
+      ? 'Medindo upload...'
+      : 'Medindo download...'
 
   return (
-    <div className="app-shell">
+    <div className={`app-shell ${darkMode ? 'dark-theme' : ''}`}>
+      <style>{`
+        @keyframes liquidWaveFloat {
+          0%, 100% { transform: translateX(-8%) scaleY(1); }
+          50% { transform: translateX(8%) scaleY(1.35); }
+        }
+        .liquid-wave-surface {
+          position: absolute;
+          top: -6px;
+          left: -10%;
+          right: -10%;
+          height: 10px;
+          animation: liquidWaveFloat 2.2s ease-in-out infinite;
+          pointer-events: none;
+        }
+
+        .theme-toggle-btn {
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          width: 36px;
+          height: 36px;
+          border-radius: 10px;
+          border: 1px solid #d2e4d8;
+          background: #f3f8f5;
+          color: #2f4f42;
+          cursor: pointer;
+          transition: all 0.2s ease;
+        }
+        .theme-toggle-btn:hover {
+          background: #e4f0e9;
+          color: #16865b;
+        }
+
+        /* Paleta Tema Escuro */
+        body.dark-theme,
+        .app-shell.dark-theme {
+          background-color: #0b1310;
+          color: #e6f0ec;
+        }
+        .app-shell.dark-theme .topbar {
+          background-color: #101b17;
+          border-bottom-color: #1e3028;
+        }
+        .app-shell.dark-theme .brand {
+          color: #eef6f2;
+        }
+        .app-shell.dark-theme .nav-item {
+          color: #9bb3a8;
+        }
+        .app-shell.dark-theme .nav-item:hover {
+          background-color: #162620;
+          color: #e6f0ec;
+        }
+        .app-shell.dark-theme .nav-item.active {
+          background-color: #173026;
+          color: #34d399;
+        }
+        .app-shell.dark-theme .theme-toggle-btn {
+          background: #162620;
+          border-color: #263d33;
+          color: #fbbf24;
+        }
+        .app-shell.dark-theme .theme-toggle-btn:hover {
+          background: #1d322a;
+        }
+        .app-shell.dark-theme .online-status {
+          background-color: #132820;
+          border-color: #1f4234;
+          color: #34d399;
+        }
+        .app-shell.dark-theme .online-status.offline {
+          background-color: #2a1517;
+          border-color: #4c2226;
+          color: #f87171;
+        }
+        .app-shell.dark-theme .page-heading h1 {
+          color: #f0f7f4;
+        }
+        .app-shell.dark-theme .page-heading p {
+          color: #93aba0;
+        }
+        .app-shell.dark-theme .metric-card,
+        .app-shell.dark-theme .quality-panel,
+        .app-shell.dark-theme .chart-panel,
+        .app-shell.dark-theme .history-table-wrap,
+        .app-shell.dark-theme .placeholder-card {
+          background-color: #121e19;
+          border-color: #1f322a;
+          box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
+        }
+        .app-shell.dark-theme .metric-label,
+        .app-shell.dark-theme .quality-label,
+        .app-shell.dark-theme .chart-foot,
+        .app-shell.dark-theme .legend,
+        .app-shell.dark-theme .empty-chart span,
+        .app-shell.dark-theme .placeholder-card span {
+          color: #8ea79c;
+        }
+        .app-shell.dark-theme .metric-value strong,
+        .app-shell.dark-theme .chart-title h2,
+        .app-shell.dark-theme .empty-chart strong,
+        .app-shell.dark-theme .placeholder-card strong {
+          color: #f0f7f4;
+        }
+        .app-shell.dark-theme .metric-value span {
+          color: #8ea79c;
+        }
+        .app-shell.dark-theme .metric-icon,
+        .app-shell.dark-theme .quality-icon,
+        .app-shell.dark-theme .empty-icon {
+          background-color: #182b23;
+          color: #34d399;
+        }
+        .app-shell.dark-theme .quality-panel small {
+          color: #93aba0;
+        }
+        .app-shell.dark-theme .chart-tooltip {
+          background-color: #162620;
+          border-color: #284237;
+          color: #e6f0ec;
+        }
+        .app-shell.dark-theme .history-table-wrap th {
+          background-color: #162620;
+          color: #a9c0b6;
+          border-bottom-color: #243930;
+        }
+        .app-shell.dark-theme .history-table-wrap td {
+          color: #dce9e3;
+          border-bottom-color: #1c2e26;
+        }
+        .app-shell.dark-theme .history-table-wrap tr:hover td {
+          background-color: #16251f;
+        }
+        .app-shell.dark-theme .footer {
+          color: #7c968b;
+          border-top-color: #1c2e26;
+        }
+        .app-shell.dark-theme .error-banner {
+          background-color: #2b1417;
+          border-color: #5c2328;
+          color: #fca5a5;
+        }
+      `}</style>
+
       <header className="topbar">
         <button className="brand" onClick={() => setPage('Dashboard')} aria-label="Ir para dashboard">
           <span className="brand-mark"><Network size={29} strokeWidth={2.2} /></span>
@@ -260,10 +545,24 @@ export default function App() {
         </nav>
 
         <div className="topbar-right">
+          <button
+            type="button"
+            className="theme-toggle-btn"
+            onClick={() => setDarkMode((prev) => !prev)}
+            aria-label={darkMode ? 'Ativar tema claro' : 'Ativar tema escuro'}
+            title={darkMode ? 'Tema claro' : 'Tema escuro'}
+          >
+            {darkMode ? <Sun size={18} /> : <Moon size={18} />}
+          </button>
+
           <span className={`online-status ${online ? '' : 'offline'}`}>
             <i /> {online ? 'Online' : 'Offline'}
           </span>
-          <button className="profile-button" aria-label="Perfil"><CircleUserRound size={27} /><ChevronDown size={14} /></button>
+
+          { /*BOTAO DE PERFIL REMOVIDO DEIXE COMENTADO PARA FUTURAS IMPLEMENTAÇÕES*/
+            
+          /*<button className="profile-button" aria-label="Perfil"><CircleUserRound size={27} /><ChevronDown size={14} /></button>*/}
+         
         </div>
       </header>
 
@@ -282,10 +581,11 @@ export default function App() {
                   aria-label="Selecionar servidor de teste"
                   style={{
                     display: 'inline-flex',
-                    background: '#e9f2ec',
+                    background: darkMode ? '#162620' : '#e9f2ec',
                     padding: '4px',
                     borderRadius: '10px',
-                    border: '1px solid #d2e4d8'
+                    border: darkMode ? '1px solid #263d33' : '1px solid #d2e4d8',
+                    transition: 'background-color 0.25s ease, border-color 0.25s ease'
                   }}
                 >
                   <button
@@ -302,9 +602,13 @@ export default function App() {
                       cursor: loading ? 'not-allowed' : 'pointer',
                       fontWeight: 600,
                       fontSize: '0.85rem',
-                      background: target === 'local' ? '#ffffff' : 'transparent',
-                      color: target === 'local' ? '#16865b' : '#4b6358',
-                      boxShadow: target === 'local' ? '0 1px 3px rgba(0,0,0,0.08)' : 'none'
+                      background: target === 'local'
+                        ? (darkMode ? '#22382f' : '#ffffff')
+                        : 'transparent',
+                      color: target === 'local'
+                        ? (darkMode ? '#34d399' : '#16865b')
+                        : (darkMode ? '#93aba0' : '#4b6358'),
+                      boxShadow: target === 'local' ? '0 1px 3px rgba(0,0,0,0.12)' : 'none'
                     }}
                   >
                     <MapPin size={15} /> Local
@@ -323,9 +627,13 @@ export default function App() {
                       cursor: loading ? 'not-allowed' : 'pointer',
                       fontWeight: 600,
                       fontSize: '0.85rem',
-                      background: target === 'sp' ? '#ffffff' : 'transparent',
-                      color: target === 'sp' ? '#16865b' : '#4b6358',
-                      boxShadow: target === 'sp' ? '0 1px 3px rgba(0,0,0,0.08)' : 'none'
+                      background: target === 'sp'
+                        ? (darkMode ? '#22382f' : '#ffffff')
+                        : 'transparent',
+                      color: target === 'sp'
+                        ? (darkMode ? '#34d399' : '#16865b')
+                        : (darkMode ? '#93aba0' : '#4b6358'),
+                      boxShadow: target === 'sp' ? '0 1px 3px rgba(0,0,0,0.12)' : 'none'
                     }}
                   >
                     <Globe size={15} /> São Paulo
@@ -336,28 +644,14 @@ export default function App() {
                   type="button"
                   className="test-button"
                   onClick={runTest}
-                  disabled={!isSpUnavailable && (loading || !online)}
-                  aria-disabled={isSpUnavailable}
-                  style={
-                    isSpUnavailable
-                      ? {
-                          background: '#cbd5e1',
-                          color: '#475569',
-                          cursor: 'not-allowed',
-                          boxShadow: 'none',
-                          opacity: 0.85
-                        }
-                      : undefined
-                  }
+                  disabled={loading || !online}
                 >
                   {loading ? (
                     <LoaderCircle className="spin" size={19} />
-                  ) : isSpUnavailable ? (
-                    <Lock size={17} />
                   ) : (
                     <Play size={18} fill="currentColor" />
                   )}
-                  {loading ? 'Testando conexão...' : 'Iniciar teste'}
+                  {buttonLabel}
                 </button>
               </div>
             </section>
@@ -371,9 +665,26 @@ export default function App() {
                 unit="ms"
                 kind="ping"
                 subtitle={pingSubtitle}
+                darkMode={darkMode}
               />
-              <MetricCard label="DOWNLOAD" value={latest?.download_mbps ?? '—'} unit="Mbps" kind="download" />
-              <MetricCard label="UPLOAD" value={latest?.upload_mbps ?? '—'} unit="Mbps" kind="upload" />
+              <MetricCard
+                label="DOWNLOAD"
+                value={activeDownloadValue}
+                unit="Mbps"
+                kind="download"
+                fillPercent={downloadFillPercent}
+                isMeasuring={loading && testPhase === 'download'}
+                darkMode={darkMode}
+              />
+              <MetricCard
+                label="UPLOAD"
+                value={activeUploadValue}
+                unit="Mbps"
+                kind="upload"
+                fillPercent={uploadFillPercent}
+                isMeasuring={loading && testPhase === 'upload'}
+                darkMode={darkMode}
+              />
               <div className="quality-panel">
                 <div className="quality-icon"><Check size={29} strokeWidth={3} /></div>
                 <div>
@@ -402,17 +713,28 @@ export default function App() {
                     <AreaChart data={chartData} margin={{ top: 12, right: 10, left: 0, bottom: 0 }}>
                       <defs>
                         <linearGradient id="downloadFill" x1="0" y1="0" x2="0" y2="1">
-                          <stop offset="0%" stopColor="#16865b" stopOpacity={0.17} />
+                          <stop offset="0%" stopColor="#16865b" stopOpacity={darkMode ? 0.32 : 0.17} />
                           <stop offset="100%" stopColor="#16865b" stopOpacity={0.01} />
                         </linearGradient>
                         <linearGradient id="uploadFill" x1="0" y1="0" x2="0" y2="1">
-                          <stop offset="0%" stopColor="#0f766e" stopOpacity={0.14} />
+                          <stop offset="0%" stopColor="#0f766e" stopOpacity={darkMode ? 0.28 : 0.14} />
                           <stop offset="100%" stopColor="#0f766e" stopOpacity={0.01} />
                         </linearGradient>
                       </defs>
-                      <CartesianGrid stroke="#e2ebe5" vertical={true} />
-                      <XAxis dataKey="time" tick={{ fill: '#71877d', fontSize: 12 }} axisLine={{ stroke: '#dce8df' }} tickLine={false} />
-                      <YAxis tick={{ fill: '#71877d', fontSize: 12 }} axisLine={false} tickLine={false} unit=" Mbps" width={75} />
+                      <CartesianGrid stroke={darkMode ? '#1e3028' : '#e2ebe5'} vertical={true} />
+                      <XAxis
+                        dataKey="time"
+                        tick={{ fill: darkMode ? '#8ea79c' : '#71877d', fontSize: 12 }}
+                        axisLine={{ stroke: darkMode ? '#243930' : '#dce8df' }}
+                        tickLine={false}
+                      />
+                      <YAxis
+                        tick={{ fill: darkMode ? '#8ea79c' : '#71877d', fontSize: 12 }}
+                        axisLine={false}
+                        tickLine={false}
+                        unit=" Mbps"
+                        width={75}
+                      />
                       <Tooltip content={<CustomTooltip />} />
                       <Area type="monotone" dataKey="download" name="Download" stroke="#16865b" strokeWidth={3} fill="url(#downloadFill)" dot={{ r: 4, fill: '#16865b', strokeWidth: 0 }} activeDot={{ r: 6 }} />
                       <Area type="monotone" dataKey="upload" name="Upload" stroke="#0f766e" strokeWidth={3} fill="url(#uploadFill)" dot={{ r: 4, fill: '#0f766e', strokeWidth: 0 }} activeDot={{ r: 6 }} />
@@ -453,9 +775,13 @@ export default function App() {
                   gap: '8px',
                   padding: '10px 16px',
                   borderRadius: '10px',
-                  border: '1px solid #fecaca',
-                  background: !history.length || clearing || !online ? '#f8fafc' : '#fef2f2',
-                  color: !history.length || clearing || !online ? '#94a3b8' : '#dc2626',
+                  border: darkMode ? '1px solid #5c2328' : '1px solid #fecaca',
+                  background: !history.length || clearing || !online
+                    ? (darkMode ? '#162620' : '#f8fafc')
+                    : (darkMode ? '#2b1417' : '#fef2f2'),
+                  color: !history.length || clearing || !online
+                    ? (darkMode ? '#526b60' : '#94a3b8')
+                    : (darkMode ? '#fca5a5' : '#dc2626'),
                   fontWeight: 600,
                   fontSize: '0.9rem',
                   cursor: !history.length || clearing || !online ? 'not-allowed' : 'pointer',
@@ -474,7 +800,7 @@ export default function App() {
                 <thead>
                   <tr>
                     <th>Data e hora</th>
-                    <th>Destino</th>
+                    <th>Servidor</th>
                     <th>Ping</th>
                     <th>Download</th>
                     <th>Upload</th>
@@ -509,103 +835,6 @@ export default function App() {
         )}
       </main>
 
-      {showSpPopup && (
-        <div
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby="sp-modal-title"
-          onClick={() => setShowSpPopup(false)}
-          style={{
-            position: 'fixed',
-            inset: 0,
-            background: 'rgba(15, 23, 42, 0.45)',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            padding: '16px',
-            zIndex: 1000
-          }}
-        >
-          <div
-            onClick={(e) => e.stopPropagation()}
-            style={{
-              background: '#ffffff',
-              borderRadius: '16px',
-              padding: '24px',
-              maxWidth: '400px',
-              width: '100%',
-              boxShadow: '0 20px 25px -5px rgba(0, 0, 0, 0.15)',
-              border: '1px solid #e2e8f0'
-            }}
-          >
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '12px' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '10px', color: '#0f766e' }}>
-                <Info size={22} />
-                <h3 id="sp-modal-title" style={{ margin: 0, fontSize: '1.05rem', color: '#0f172a' }}>
-                  Função indisponível
-                </h3>
-              </div>
-              <button
-                type="button"
-                onClick={() => setShowSpPopup(false)}
-                aria-label="Fechar aviso"
-                style={{
-                  background: 'transparent',
-                  border: 'none',
-                  cursor: 'pointer',
-                  color: '#64748b',
-                  padding: '4px'
-                }}
-              >
-                <X size={20} />
-              </button>
-            </div>
-
-            <p style={{ margin: '0 0 20px', fontSize: '0.93rem', lineHeight: 1.5, color: '#475569' }}>
-              O teste completo de download e upload no servidor de <strong>São Paulo</strong> ainda não está disponível nesta versão. Por enquanto, você pode acompanhar o <strong>Ping em tempo real</strong> para São Paulo ou alternar para <strong>Local</strong> para executar o teste completo.
-            </p>
-
-            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '8px' }}>
-              <button
-                type="button"
-                onClick={() => {
-                  setShowSpPopup(false)
-                  handleTargetChange('local')
-                }}
-                style={{
-                  padding: '9px 14px',
-                  borderRadius: '9px',
-                  border: '1px solid #cbd5e1',
-                  background: '#f8fafc',
-                  color: '#334155',
-                  fontWeight: 600,
-                  fontSize: '0.85rem',
-                  cursor: 'pointer'
-                }}
-              >
-                Mudar para Local
-              </button>
-              <button
-                type="button"
-                onClick={() => setShowSpPopup(false)}
-                style={{
-                  padding: '9px 16px',
-                  borderRadius: '9px',
-                  border: 'none',
-                  background: '#16865b',
-                  color: '#ffffff',
-                  fontWeight: 600,
-                  fontSize: '0.85rem',
-                  cursor: 'pointer'
-                }}
-              >
-                Entendi
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
       {showOfflinePopup && (
         <div
           role="dialog"
@@ -615,7 +844,7 @@ export default function App() {
           style={{
             position: 'fixed',
             inset: 0,
-            background: 'rgba(15, 23, 42, 0.45)',
+            background: 'rgba(5, 10, 8, 0.65)',
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',
@@ -626,19 +855,19 @@ export default function App() {
           <div
             onClick={(e) => e.stopPropagation()}
             style={{
-              background: '#ffffff',
+              background: darkMode ? '#121e19' : '#ffffff',
               borderRadius: '16px',
               padding: '24px',
               maxWidth: '400px',
               width: '100%',
-              boxShadow: '0 20px 25px -5px rgba(0, 0, 0, 0.15)',
-              border: '1px solid #fecaca'
+              boxShadow: '0 20px 25px -5px rgba(0, 0, 0, 0.35)',
+              border: darkMode ? '1px solid #5c2328' : '1px solid #fecaca'
             }}
           >
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '12px' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '10px', color: '#dc2626' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '10px', color: darkMode ? '#f87171' : '#dc2626' }}>
                 <WifiOff size={22} />
-                <h3 id="offline-modal-title" style={{ margin: 0, fontSize: '1.05rem', color: '#0f172a' }}>
+                <h3 id="offline-modal-title" style={{ margin: 0, fontSize: '1.05rem', color: darkMode ? '#f0f7f4' : '#0f172a' }}>
                   Sem conexão com a internet
                 </h3>
               </div>
@@ -650,7 +879,7 @@ export default function App() {
                   background: 'transparent',
                   border: 'none',
                   cursor: 'pointer',
-                  color: '#64748b',
+                  color: darkMode ? '#8ea79c' : '#64748b',
                   padding: '4px'
                 }}
               >
@@ -658,7 +887,7 @@ export default function App() {
               </button>
             </div>
 
-            <p style={{ margin: '0 0 20px', fontSize: '0.93rem', lineHeight: 1.5, color: '#475569' }}>
+            <p style={{ margin: '0 0 20px', fontSize: '0.93rem', lineHeight: 1.5, color: darkMode ? '#a9c0b6' : '#475569' }}>
               Não foi possível detectar acesso externo à internet no momento. Mesmo que seu roteador local esteja ligado, a conexão externa está indisponível. Verifique seu cabo de rede ou Wi-Fi e tente novamente.
             </p>
 
